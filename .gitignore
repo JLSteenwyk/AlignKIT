@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+
+# Training artifacts
+checkpoints/
+checkpoints_msa/
+logs/
+logs_msa/
+plots/
+plots_msa/
+results_pilot/
+training_100k.log
+
+# Data (large, downloaded via setup.sh)
+data/bb3_release/
+data/benchmarks/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
