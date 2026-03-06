@@ -1,0 +1,22 @@
+{
+  "n_actions": 185,
+  "n_cases": 42,
+  "oracle_reward": 0.5360666581784128,
+  "oracle_sp": 0.750117593374716,
+  "oracle_tc": 0.3220157229821099,
+  "best_fixed_action": 125,
+  "best_fixed_reward": 0.5057871249121785,
+  "current_agent_reward": 0.56,
+  "headroom_fixed": -0.05421287508782158,
+  "headroom_oracle": -0.02393334182158724,
+  "mafft_only_oracle": 0.5315987029929453,
+  "muscle_only_oracle": 0.49928239419732795,
+  "clustalo_only_oracle": 0.48567211564630963,
+  "oracle_tool_distribution": {
+    "mafft": 34,
+    "muscle": 3,
+    "clustalo": 5
+  },
+  "unique_best_actions": 35,
+  "total_time_s": 37045.28375124931
+}

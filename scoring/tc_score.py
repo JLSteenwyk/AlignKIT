@@ -54,7 +54,7 @@ def tc_score(
 ) -> float:
     """Compute TC score: fraction of reference columns found in prediction.
 
-    TC = |ref_columns ∩ pred_columns| / |ref_columns|
+    TC = |ref_columns & pred_columns| / |ref_columns|
 
     For pairwise alignments, this is numerically equivalent to SP score,
     but the conceptual distinction is educational: SP focuses on residue pairs

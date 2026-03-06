@@ -4,70 +4,64 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-
-from agent.policy_network import PolicyNetwork
-from config import Config
+import torch.nn as nn
 
 
 def save_checkpoint(
-    policy: PolicyNetwork,
+    policy: nn.Module,
     optimizer: torch.optim.Optimizer,
     episode: int,
     checkpoint_dir: Path,
     filename: Optional[str] = None,
+    extra: Optional[dict] = None,
 ):
     """Save model and optimizer state.
 
     Args:
-        policy: The policy network.
+        policy: The policy network (any nn.Module).
         optimizer: The optimizer.
         episode: Current episode number.
         checkpoint_dir: Directory to save checkpoints.
         filename: Optional custom filename.
+        extra: Optional dict of additional state to save (e.g. baseline).
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     if filename is None:
         filename = f"checkpoint_ep{episode}.pt"
 
     path = checkpoint_dir / filename
-    torch.save(
-        {
-            "episode": episode,
-            "policy_state_dict": policy.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        path,
-    )
+    data = {
+        "episode": episode,
+        "policy_state_dict": policy.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if extra is not None:
+        data.update(extra)
+    torch.save(data, path)
     # Also save as "latest"
     latest_path = checkpoint_dir / "checkpoint_latest.pt"
-    torch.save(
-        {
-            "episode": episode,
-            "policy_state_dict": policy.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        latest_path,
-    )
+    torch.save(data, latest_path)
 
 
 def load_checkpoint(
-    policy: PolicyNetwork,
+    policy: nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     checkpoint_dir: Path,
     filename: str = "checkpoint_latest.pt",
     device: torch.device = torch.device("cpu"),
-) -> int:
+) -> dict:
     """Load model and optimizer state from checkpoint.
 
     Args:
-        policy: The policy network to load weights into.
+        policy: The policy network to load weights into (any nn.Module).
         optimizer: The optimizer to load state into (optional).
         checkpoint_dir: Directory containing checkpoints.
         filename: Checkpoint filename.
         device: Device to map tensors to.
 
     Returns:
-        Episode number from the checkpoint.
+        The full checkpoint dict (keys: episode, policy_state_dict,
+        optimizer_state_dict, and any extra state like baseline).
     """
     path = checkpoint_dir / filename
     if not path.exists():
@@ -82,4 +76,4 @@ def load_checkpoint(
     policy.load_state_dict(checkpoint["policy_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint.get("episode", 0)
+    return checkpoint

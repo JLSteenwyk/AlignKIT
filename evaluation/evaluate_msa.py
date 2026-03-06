@@ -1,159 +1,255 @@
-"""Greedy evaluation of trained MSA agent on held-out data."""
+"""Evaluation and baselines for MSA RL parameter learning."""
 
-import json
-import random
-from collections import Counter
+import subprocess
+import time
+from collections import defaultdict
+from io import StringIO
 from pathlib import Path
-from typing import Dict
 
 import numpy as np
 import torch
+from Bio import AlignIO
 
-from agent.policy_network import PolicyNetwork
-from agent.reinforce import ReinforceAgent
-from config_msa import MSAConfig
-from data.msa_dataset import build_msa_datasets
-from env.msa_action_space import MSAActionSpace
-from env.msa_alignment_env import MSAAlignmentEnv
+from agent.continuous_policy import ContinuousPolicy
+from agent.reinforce_continuous import ReinforceContinuousAgent
+from config import MSAConfig
+from data.msa_dataset import MSADataset, MSATestCase, load_msa_test_cases
+from env.msa_env import MSAEnv
+from scoring.msa_sp_score import msa_sp_score
+from scoring.msa_tc_score import msa_tc_score
+from scoring.reward import compute_reward
 from training.checkpointer import load_checkpoint
 
 
-def evaluate_msa_agent(
-    config: MSAConfig,
-    checkpoint_file: str = "checkpoint_latest.pt",
-    max_cases: int = None,
-) -> Dict:
-    """Run full greedy evaluation on held-out MSA data.
+def _run_mafft(config, fasta_path, op, ep):
+    """Run MAFFT with given op/ep and return MSA or None."""
+    cmd = [
+        str(config.mafft_bin),
+        "--localpair",
+        "--maxiterate", "10",
+        "--op", str(op),
+        "--ep", str(ep),
+        "--thread", str(config.mafft_threads),
+        "--quiet",
+        str(fasta_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=config.mafft_timeout,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return AlignIO.read(StringIO(result.stdout), "fasta")
+    except Exception:
+        return None
 
-    Args:
-        config: MSA configuration.
-        checkpoint_file: Which checkpoint to load.
-        max_cases: Max test cases to evaluate (None = all).
 
-    Returns:
-        Dict with overall and per-set metrics.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _score_case(config, case, op, ep):
+    """Run MAFFT on a case and return (reward, sp, tc)."""
+    pred_msa = _run_mafft(config, case.fasta_path, op, ep)
+    if pred_msa is None or len(pred_msa) < 2:
+        return 0.0, 0.0, 0.0
+    sp = msa_sp_score(pred_msa, case.ref_alignment)
+    tc = msa_tc_score(pred_msa, case.ref_alignment)
+    r = compute_reward(sp, tc, config.msa_sp_weight, config.msa_tc_weight)
+    return r, sp, tc
 
-    # Load data
-    benchmark_dir = config.benchmark_dir if config.use_benchmarks else None
-    _, eval_dataset = build_msa_datasets(
-        config.data_dir, config.all_ref_sets, config.split_ratio, config.split_seed,
-        benchmark_dir=benchmark_dir,
-    )
-    if len(eval_dataset) == 0:
-        print("No evaluation data available.")
-        return {}
 
-    # Build env
-    action_space = MSAActionSpace(config)
-    env = MSAAlignmentEnv(eval_dataset, action_space, config)
+# ---- Baselines ----
 
-    # Load agent
-    policy = PolicyNetwork(
-        input_dim=config.input_dim,
-        hidden_sizes=config.hidden_sizes,
-        output_dim=config.num_actions,
-    )
-    episode = load_checkpoint(policy, None, config.checkpoint_dir, checkpoint_file, device)
-    policy.to(device)
-    policy.eval()
-
-    agent = ReinforceAgent(policy, config, device)
-    print(f"Loaded checkpoint from episode {episode}")
-
-    # Evaluate
+def mafft_default_baseline(eval_dataset, config):
+    """MAFFT --localpair --maxiterate 10 with default params (op=1.53, ep=0.0)."""
+    op, ep = 1.53, 0.0
     rewards, sps, tcs = [], [], []
-    per_set = {}
-    action_counts = Counter()
-    tool_counts = Counter()
-    elapsed_times = []
+    per_set = defaultdict(lambda: {"rewards": [], "sps": [], "tcs": []})
 
-    eval_cases = list(eval_dataset)
-    if max_cases and len(eval_cases) > max_cases:
-        random.seed(config.seed)
-        eval_cases = random.sample(eval_cases, max_cases)
-    print(f"Evaluating on {len(eval_cases)} MSA test cases...")
+    t0 = time.time()
+    for case in eval_dataset:
+        r, sp, tc = _score_case(config, case, op, ep)
+        rewards.append(r)
+        sps.append(sp)
+        tcs.append(tc)
+        per_set[case.ref_set]["rewards"].append(r)
+        per_set[case.ref_set]["sps"].append(sp)
+        per_set[case.ref_set]["tcs"].append(tc)
+    elapsed = time.time() - t0
 
-    for case in eval_cases:
-        state = env.reset_with_case(case)
-        action = agent.select_action_greedy(state)
-        reward, info = env.step(action)
-
-        rewards.append(reward)
-        sps.append(info.get("sp", 0.0))
-        tcs.append(info.get("tc", 0.0))
-        elapsed_times.append(info.get("elapsed", 0.0))
-
-        action_counts[action] += 1
-        tool_counts[info.get("tool", "unknown")] += 1
-
-        rs = info.get("ref_set", "unknown")
-        if rs not in per_set:
-            per_set[rs] = {"rewards": [], "sps": [], "tcs": [], "actions": [], "tools": []}
-        per_set[rs]["rewards"].append(reward)
-        per_set[rs]["sps"].append(info.get("sp", 0.0))
-        per_set[rs]["tcs"].append(info.get("tc", 0.0))
-        per_set[rs]["actions"].append(action)
-        per_set[rs]["tools"].append(info.get("tool", "unknown"))
-
-    # Summary
-    results = {
-        "overall": {
-            "reward_mean": float(np.mean(rewards)),
-            "reward_std": float(np.std(rewards)),
-            "sp_mean": float(np.mean(sps)),
-            "sp_std": float(np.std(sps)),
-            "tc_mean": float(np.mean(tcs)),
-            "tc_std": float(np.std(tcs)),
-            "avg_elapsed": float(np.mean(elapsed_times)),
-            "n_cases": len(rewards),
-        },
-        "tool_distribution": dict(tool_counts),
+    result = {
+        "reward_mean": float(np.mean(rewards)),
+        "reward_std": float(np.std(rewards)),
+        "sp_mean": float(np.mean(sps)),
+        "tc_mean": float(np.mean(tcs)),
+        "n_cases": len(rewards),
+        "op": op, "ep": ep,
+        "elapsed": elapsed,
         "per_set": {},
-        "action_distribution": {},
     }
-
     for rs, data in per_set.items():
-        rs_tool_counts = Counter(data["tools"])
-        results["per_set"][rs] = {
+        result["per_set"][rs] = {
             "reward_mean": float(np.mean(data["rewards"])),
-            "reward_std": float(np.std(data["rewards"])),
             "sp_mean": float(np.mean(data["sps"])),
             "tc_mean": float(np.mean(data["tcs"])),
             "n_cases": len(data["rewards"]),
-            "tool_distribution": dict(rs_tool_counts),
         }
+    return result
 
-        # Top actions for this set
-        set_action_counts = Counter(data["actions"])
-        top_actions = set_action_counts.most_common(5)
-        results["per_set"][rs]["top_actions"] = [
-            {"action": a, "count": c, "desc": action_space.describe(a)}
-            for a, c in top_actions
-        ]
 
-    # Overall action distribution
-    top_overall = action_counts.most_common(10)
-    results["action_distribution"]["top_10"] = [
-        {"action": a, "count": c, "desc": action_space.describe(a)}
-        for a, c in top_overall
-    ]
+def best_constant_baseline(eval_dataset, config):
+    """Grid search over constant (op, ep) to find best fixed parameters."""
+    op_values = [0.5, 1.0, 1.53, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+    ep_values = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0]
 
-    # Print summary
-    print("\n=== MSA Evaluation Results ===")
-    print(f"Overall: R={results['overall']['reward_mean']:.4f} +/- {results['overall']['reward_std']:.4f}")
-    print(f"         SP={results['overall']['sp_mean']:.4f}  TC={results['overall']['tc_mean']:.4f}")
-    print(f"         N={results['overall']['n_cases']} MSAs, avg_time={results['overall']['avg_elapsed']:.1f}s")
-    print(f"Tool distribution: {dict(tool_counts)}")
-    for rs, data in sorted(results["per_set"].items()):
-        print(f"  {rs}: R={data['reward_mean']:.4f} SP={data['sp_mean']:.4f} TC={data['tc_mean']:.4f} (n={data['n_cases']})")
+    cases = list(eval_dataset)
+    best_reward = -1
+    best_op, best_ep = 1.53, 0.0
 
-    # Save results
-    config.ensure_dirs()
-    results_path = config.log_dir / "msa_eval_results.json"
-    with open(results_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {results_path}")
+    for op in op_values:
+        for ep in ep_values:
+            rewards = []
+            for case in cases:
+                r, _, _ = _score_case(config, case, op, ep)
+                rewards.append(r)
+            mean_r = float(np.mean(rewards))
+            if mean_r > best_reward:
+                best_reward = mean_r
+                best_op, best_ep = op, ep
+            print("  grid op=%.2f ep=%.2f -> R=%.4f" % (op, ep, mean_r))
 
-    return results
+    # Re-evaluate best with full metrics
+    rewards, sps, tcs = [], [], []
+    for case in cases:
+        r, sp, tc = _score_case(config, case, best_op, best_ep)
+        rewards.append(r)
+        sps.append(sp)
+        tcs.append(tc)
+
+    return {
+        "reward_mean": float(np.mean(rewards)),
+        "reward_std": float(np.std(rewards)),
+        "sp_mean": float(np.mean(sps)),
+        "tc_mean": float(np.mean(tcs)),
+        "n_cases": len(rewards),
+        "op": best_op, "ep": best_ep,
+    }
+
+
+def per_case_oracle(eval_dataset, config):
+    """Per-case oracle: best (op, ep) per case from grid."""
+    op_values = [0.5, 1.0, 1.53, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+    ep_values = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0]
+
+    best_rewards, best_sps, best_tcs = [], [], []
+
+    for case in eval_dataset:
+        best_r = -1
+        best_sp, best_tc = 0, 0
+        for op in op_values:
+            for ep in ep_values:
+                r, sp, tc = _score_case(config, case, op, ep)
+                if r > best_r:
+                    best_r = r
+                    best_sp, best_tc = sp, tc
+        best_rewards.append(best_r)
+        best_sps.append(best_sp)
+        best_tcs.append(best_tc)
+        print("  oracle %s: R=%.4f" % (case.case_id, best_r))
+
+    return {
+        "reward_mean": float(np.mean(best_rewards)),
+        "reward_std": float(np.std(best_rewards)),
+        "sp_mean": float(np.mean(best_sps)),
+        "tc_mean": float(np.mean(best_tcs)),
+        "n_cases": len(best_rewards),
+    }
+
+
+# ---- Agent evaluation ----
+
+def evaluate_msa_agent(config: MSAConfig, checkpoint: str, max_cases: int = None):
+    """Full evaluation: load agent, run on eval set, compare to baselines."""
+
+    device = torch.device("cpu")
+
+    # Data
+    print("Loading evaluation MSA test cases...")
+    eval_cases = load_msa_test_cases(config.data_dir, config.eval_ref_sets)
+    eval_dataset = MSADataset(eval_cases)
+
+    if len(eval_dataset) == 0:
+        print("No evaluation data. Check BAliBASE data path.")
+        return
+
+    eval_list = list(eval_dataset)
+    if max_cases and len(eval_list) > max_cases:
+        rng = np.random.RandomState(42)
+        indices = rng.choice(len(eval_list), max_cases, replace=False)
+        eval_list = [eval_list[i] for i in indices]
+    eval_subset = MSADataset(eval_list)
+
+    # Load agent
+    policy = ContinuousPolicy(
+        input_dim=config.input_dim,
+        hidden_sizes=config.hidden_sizes,
+        action_dim=config.action_dim,
+        initial_log_std=config.initial_log_std,
+        min_std=config.min_std,
+        gap_open_range=(config.op_min, config.op_max),
+        gap_extend_range=(config.ep_min, config.ep_max),
+        num_regions=1,
+    )
+    load_checkpoint(policy, None, config.checkpoint_dir, checkpoint, device)
+    policy.eval()
+
+    env = MSAEnv(eval_subset, config)
+    agent = ReinforceContinuousAgent(policy, config, device)
+
+    # Evaluate agent
+    print("\n=== RL Agent (greedy) on %d MSAs ===" % len(eval_list))
+    rewards, sps, tcs = [], [], []
+    per_set = defaultdict(lambda: {"rewards": [], "sps": [], "tcs": []})
+
+    t0 = time.time()
+    for case in eval_list:
+        state = env.reset_with(case)
+        action = agent.select_action_greedy(state)
+        reward, info = env.step(action)
+        rewards.append(reward)
+        sps.append(info["sp"])
+        tcs.append(info["tc"])
+        per_set[case.ref_set]["rewards"].append(reward)
+        per_set[case.ref_set]["sps"].append(info["sp"])
+        per_set[case.ref_set]["tcs"].append(info["tc"])
+
+    elapsed = time.time() - t0
+    print("  Reward: %.4f +/- %.4f" % (np.mean(rewards), np.std(rewards)))
+    print("  SP: %.4f  TC: %.4f" % (np.mean(sps), np.mean(tcs)))
+    print("  Time: %.1fs" % elapsed)
+    for rs in sorted(per_set.keys()):
+        d = per_set[rs]
+        print("    %s: R=%.4f SP=%.4f TC=%.4f (n=%d)" % (
+            rs, np.mean(d["rewards"]), np.mean(d["sps"]),
+            np.mean(d["tcs"]), len(d["rewards"])))
+
+    # MAFFT default baseline
+    print("\n=== MAFFT Default (op=1.53, ep=0.0, --localpair --maxiterate 10) ===")
+    default_result = mafft_default_baseline(eval_subset, config)
+    print("  Reward: %.4f +/- %.4f" % (default_result["reward_mean"], default_result["reward_std"]))
+    print("  SP: %.4f  TC: %.4f" % (default_result["sp_mean"], default_result["tc_mean"]))
+    for rs, data in sorted(default_result["per_set"].items()):
+        print("    %s: R=%.4f SP=%.4f TC=%.4f (n=%d)" % (
+            rs, data["reward_mean"], data["sp_mean"],
+            data["tc_mean"], data["n_cases"]))
+
+    # Best constant baseline
+    print("\n=== Best Constant (grid search over op x ep) ===")
+    best_const = best_constant_baseline(eval_subset, config)
+    print("  Reward: %.4f +/- %.4f" % (best_const["reward_mean"], best_const["reward_std"]))
+    print("  SP: %.4f  TC: %.4f" % (best_const["sp_mean"], best_const["tc_mean"]))
+    print("  Best: op=%.2f, ep=%.2f" % (best_const["op"], best_const["ep"]))
+
+    # Per-case oracle
+    print("\n=== Per-Case Oracle ===")
+    oracle = per_case_oracle(eval_subset, config)
+    print("  Reward: %.4f +/- %.4f" % (oracle["reward_mean"], oracle["reward_std"]))
+    print("  SP: %.4f  TC: %.4f" % (oracle["sp_mean"], oracle["tc_mean"]))

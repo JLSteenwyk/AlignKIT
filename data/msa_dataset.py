@@ -132,12 +132,19 @@ def build_msa_datasets(
     split_ratio: float = 0.8,
     split_seed: int = 42,
     benchmark_dir: Optional[Path] = None,
+    subsample_benchmarks_to: Optional[int] = None,
 ) -> tuple:
     """Build train and eval MSA datasets with stratified random split.
 
     Loads BAliBASE ref_sets and optionally OXBench/SABRE/HOMSTRAD benchmarks,
     then splits 80/20 within each dataset/ref_set so that every source is
     represented in both train and eval.
+
+    If subsample_benchmarks_to is set, each external benchmark's training
+    portion is subsampled to that many cases using farthest-point sampling
+    in the 20-dim state feature space.  This equalizes database representation
+    while preserving the diversity within each benchmark.  The eval split
+    is left untouched so evaluation remains comprehensive.
 
     Returns (train_dataset, eval_dataset).
     """
@@ -167,6 +174,33 @@ def build_msa_datasets(
         train_cases.extend(cases[:n_train])
         eval_cases.extend(cases[n_train:])
         print(f"  {ref_set}: {len(cases)} total -> {n_train} train / {len(cases) - n_train} eval")
+
+    # Optionally subsample external benchmarks in the training set
+    benchmark_sets = {"HOMSTRAD", "OXBench", "SABRE"}
+    if subsample_benchmarks_to is not None:
+        from data.subsample import farthest_point_subsample
+        from env.msa_state_features import extract_msa_features
+
+        kept_train = []
+        for ref_set in sorted(benchmark_sets):
+            ref_cases = [c for c in train_cases if c.ref_set == ref_set]
+            if not ref_cases:
+                continue
+            if len(ref_cases) > subsample_benchmarks_to:
+                selected = farthest_point_subsample(
+                    ref_cases, extract_msa_features, subsample_benchmarks_to,
+                )
+                print(
+                    f"  {ref_set}: subsampled {len(ref_cases)} -> "
+                    f"{len(selected)} train (farthest-point)"
+                )
+                kept_train.extend(selected)
+            else:
+                kept_train.extend(ref_cases)
+
+        # Add back all non-benchmark train cases unchanged
+        kept_train.extend(c for c in train_cases if c.ref_set not in benchmark_sets)
+        train_cases = kept_train
 
     train_dataset = MSADataset(train_cases)
     eval_dataset = MSADataset(eval_cases)

@@ -1,221 +1,224 @@
-"""Main training loop for the MSA REINFORCE agent."""
+"""Training loop for MSA RL parameter learning (continuous op/ep for MAFFT)."""
 
+import json
 import random
 import time
-from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from agent.policy_network import PolicyNetwork
-from agent.reinforce import ReinforceAgent
-from config_msa import MSAConfig
-from data.msa_dataset import build_msa_datasets
-from env.msa_action_space import MSAActionSpace
-from env.msa_alignment_env import MSAAlignmentEnv
-from training.checkpointer import save_checkpoint
-from training.logger import JSONLLogger
+from agent.continuous_policy import ContinuousPolicy
+from agent.reinforce_continuous import ReinforceContinuousAgent
+from config import MSAConfig
+from data.msa_dataset import MSADataset, load_msa_test_cases
+from env.msa_env import MSAEnv
+from training.checkpointer import save_checkpoint, load_checkpoint
 
 
-def set_seeds(seed: int):
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def train_msa(config: MSAConfig):
-    """Run the full REINFORCE training loop for MSA tool selection.
-
-    1. Load BAliBASE MSA test cases
-    2. Create environment, agent
-    3. Collect batches of episodes, update policy
-    4. Log metrics (including tool distribution), checkpoint, evaluate
-    """
-    config.ensure_dirs()
-    set_seeds(config.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Data
-    benchmark_dir = config.benchmark_dir if config.use_benchmarks else None
-    train_dataset, eval_dataset = build_msa_datasets(
-        config.data_dir, config.all_ref_sets, config.split_ratio, config.split_seed,
-        benchmark_dir=benchmark_dir,
-    )
-    if len(train_dataset) == 0:
-        raise RuntimeError("No training data loaded. Check BAliBASE data path.")
-
-    # Environment + action space
-    action_space = MSAActionSpace(config)
-    env = MSAAlignmentEnv(train_dataset, action_space, config)
-    eval_env = MSAAlignmentEnv(eval_dataset, action_space, config)
-
-    # Agent — reuse PolicyNetwork and ReinforceAgent
-    policy = PolicyNetwork(
-        input_dim=config.input_dim,
-        hidden_sizes=config.hidden_sizes,
-        output_dim=config.num_actions,
-    )
-    agent = ReinforceAgent(policy, config, device)
-
-    # Logging
-    train_logger = JSONLLogger(config.log_dir, "msa_train")
-    eval_logger = JSONLLogger(config.log_dir, "msa_eval")
-
-    print(f"\nStarting MSA training: {config.num_episodes} episodes, batch_size={config.batch_size}")
-    print(f"Action space: {config.num_actions} actions (MAFFT: {action_space.n_mafft}, MUSCLE: {action_space.n_muscle}, ClustalO: {action_space.n_clustalo})")
-    print(f"Train MSAs: {len(train_dataset)}, Eval MSAs: {len(eval_dataset)}")
-    print()
-
-    # Training loop
-    episode = 0
-    total_start = time.time()
-
-    # Running stats
-    recent_rewards = []
-    recent_sp = []
-    recent_tc = []
-    recent_tools = []
-    recent_elapsed = []
-    recent_errors = 0
-
-    while episode < config.num_episodes:
-        # Collect a batch of episodes
-        batch = {"states": [], "actions": [], "rewards": []}
-        batch_infos = []
-
-        for _ in range(config.batch_size):
-            state = env.reset()
-            action, log_prob, entropy = agent.select_action(state)
-            reward, info = env.step(action)
-
-            batch["states"].append(state)
-            batch["actions"].append(action)
-            batch["rewards"].append(reward)
-            batch_infos.append(info)
-
-            recent_rewards.append(reward)
-            recent_sp.append(info.get("sp", 0.0))
-            recent_tc.append(info.get("tc", 0.0))
-            recent_tools.append(info.get("tool", "unknown"))
-            recent_elapsed.append(info.get("elapsed", 0.0))
-            if "error" in info:
-                recent_errors += 1
-
-        # Update policy
-        update_metrics = agent.update(batch)
-        episode += config.batch_size
-
-        # Log
-        if episode % config.log_every < config.batch_size:
-            window = config.log_every
-            avg_reward = np.mean(recent_rewards[-window:])
-            avg_sp = np.mean(recent_sp[-window:])
-            avg_tc = np.mean(recent_tc[-window:])
-            avg_elapsed = np.mean(recent_elapsed[-window:])
-
-            # Tool distribution in recent window
-            tool_window = recent_tools[-window:]
-            tool_counts = Counter(tool_window)
-            n_tw = len(tool_window) if tool_window else 1
-            mafft_frac = tool_counts.get("mafft", 0) / n_tw
-            muscle_frac = tool_counts.get("muscle", 0) / n_tw
-            clustalo_frac = tool_counts.get("clustalo", 0) / n_tw
-
-            metrics = {
-                "reward_mean": float(avg_reward),
-                "sp_mean": float(avg_sp),
-                "tc_mean": float(avg_tc),
-                "mafft_frac": float(mafft_frac),
-                "muscle_frac": float(muscle_frac),
-                "clustalo_frac": float(clustalo_frac),
-                "avg_elapsed": float(avg_elapsed),
-                "error_count": recent_errors,
-                **update_metrics,
-            }
-            train_logger.log(metrics, episode)
-
-            elapsed = time.time() - total_start
-            print(
-                f"Ep {episode:5d} | "
-                f"R={avg_reward:.4f} SP={avg_sp:.4f} TC={avg_tc:.4f} | "
-                f"MAFFT={mafft_frac:.0%} MUSCLE={muscle_frac:.0%} ClustalO={clustalo_frac:.0%} | "
-                f"Ent={update_metrics['entropy']:.3f} "
-                f"t={avg_elapsed:.1f}s | "
-                f"{elapsed:.0f}s"
-            )
-            recent_errors = 0
-
-        # Checkpoint
-        if episode % config.checkpoint_every < config.batch_size:
-            save_checkpoint(policy, agent.optimizer, episode, config.checkpoint_dir)
-
-        # Evaluate
-        if episode % config.eval_every < config.batch_size and len(eval_dataset) > 0:
-            eval_metrics = _evaluate_msa(agent, eval_env, eval_dataset, action_space)
-            eval_logger.log(eval_metrics, episode)
-            print(
-                f"  [EVAL] R={eval_metrics['reward_mean']:.4f} "
-                f"SP={eval_metrics['sp_mean']:.4f} TC={eval_metrics['tc_mean']:.4f} "
-                f"MAFFT={eval_metrics['mafft_frac']:.0%} "
-                f"MUSCLE={eval_metrics['muscle_frac']:.0%} "
-                f"ClustalO={eval_metrics['clustalo_frac']:.0%} "
-                f"(n={eval_metrics['n_cases']})"
-            )
-
-    # Final save
-    save_checkpoint(policy, agent.optimizer, episode, config.checkpoint_dir, "checkpoint_final.pt")
-    total_time = time.time() - total_start
-    print(f"\nMSA training complete: {episode} episodes in {total_time:.1f}s")
-
-
-def _evaluate_msa(agent, env, dataset, action_space, max_cases=None):
-    """Run greedy evaluation on the eval MSA dataset."""
+def _evaluate(agent, eval_env, eval_dataset, greedy=True):
+    """Run evaluation on the eval dataset. Returns dict of metrics."""
     rewards, sps, tcs = [], [], []
-    tools = []
     per_set = {}
 
-    cases = list(dataset)
-    if max_cases and len(cases) > max_cases:
-        cases = random.sample(cases, max_cases)
-
-    for case in cases:
-        state = env.reset_with_case(case)
-        action = agent.select_action_greedy(state)
-        reward, info = env.step(action)
-
+    for case in eval_dataset:
+        state = eval_env.reset_with(case)
+        if greedy:
+            action = agent.select_action_greedy(state)
+        else:
+            action, _, _, _ = agent.select_action(state)
+        reward, info = eval_env.step(action)
         rewards.append(reward)
-        sps.append(info.get("sp", 0.0))
-        tcs.append(info.get("tc", 0.0))
-        tools.append(info.get("tool", "unknown"))
+        sps.append(info["sp"])
+        tcs.append(info["tc"])
 
-        rs = info.get("ref_set", "unknown")
+        rs = case.ref_set
         if rs not in per_set:
             per_set[rs] = {"rewards": [], "sps": [], "tcs": []}
         per_set[rs]["rewards"].append(reward)
-        per_set[rs]["sps"].append(info.get("sp", 0.0))
-        per_set[rs]["tcs"].append(info.get("tc", 0.0))
-
-    tool_counts = Counter(tools)
-    n = len(tools)
+        per_set[rs]["sps"].append(info["sp"])
+        per_set[rs]["tcs"].append(info["tc"])
 
     result = {
-        "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
-        "sp_mean": float(np.mean(sps)) if sps else 0.0,
-        "tc_mean": float(np.mean(tcs)) if tcs else 0.0,
-        "mafft_frac": float(tool_counts.get("mafft", 0) / n) if n > 0 else 0.0,
-        "muscle_frac": float(tool_counts.get("muscle", 0) / n) if n > 0 else 0.0,
-        "clustalo_frac": float(tool_counts.get("clustalo", 0) / n) if n > 0 else 0.0,
+        "reward_mean": float(np.mean(rewards)),
+        "reward_std": float(np.std(rewards)),
+        "sp_mean": float(np.mean(sps)),
+        "tc_mean": float(np.mean(tcs)),
         "n_cases": len(rewards),
+        "per_set": {},
     }
-
-    for rs, data in per_set.items():
-        result[f"{rs}_reward"] = float(np.mean(data["rewards"]))
-        result[f"{rs}_sp"] = float(np.mean(data["sps"]))
-        result[f"{rs}_tc"] = float(np.mean(data["tcs"]))
-
+    for rs, data in sorted(per_set.items()):
+        result["per_set"][rs] = {
+            "reward_mean": float(np.mean(data["rewards"])),
+            "sp_mean": float(np.mean(data["sps"])),
+            "tc_mean": float(np.mean(data["tcs"])),
+            "n_cases": len(data["rewards"]),
+        }
     return result
+
+
+def train_msa(config: MSAConfig, resume_from: str = None):
+    """Main training loop for MSA alignment RL."""
+
+    # Seed
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+
+    device = torch.device("cpu")
+
+    # Data — split by ref_set
+    print("Loading training MSA test cases...")
+    train_cases = load_msa_test_cases(config.data_dir, config.train_ref_sets)
+    print("Loading evaluation MSA test cases...")
+    eval_cases = load_msa_test_cases(config.data_dir, config.eval_ref_sets)
+
+    train_dataset = MSADataset(train_cases)
+    eval_dataset = MSADataset(eval_cases)
+
+    if len(train_dataset) == 0:
+        print("No training data found. Check BAliBASE data path.")
+        return
+
+    # Environment
+    train_env = MSAEnv(train_dataset, config)
+    eval_env = MSAEnv(eval_dataset, config)
+
+    # Policy + Agent
+    # For MSA: action_dim=2 (op, ep), treat as 1 "region" with op as gap_open, ep as gap_extend
+    policy = ContinuousPolicy(
+        input_dim=config.input_dim,
+        hidden_sizes=config.hidden_sizes,
+        action_dim=config.action_dim,
+        initial_log_std=config.initial_log_std,
+        min_std=config.min_std,
+        gap_open_range=(config.op_min, config.op_max),
+        gap_extend_range=(config.ep_min, config.ep_max),
+        num_regions=1,
+    )
+    agent = ReinforceContinuousAgent(policy, config, device)
+
+    start_episode = 0
+
+    if resume_from:
+        ckpt = load_checkpoint(policy, agent.optimizer, config.checkpoint_dir, resume_from, device)
+        start_episode = ckpt.get("episode", 0)
+        print("Resumed from episode %d" % start_episode)
+
+    # Logging
+    config.log_dir.mkdir(parents=True, exist_ok=True)
+    train_log_path = config.log_dir / "msa_train.jsonl"
+    eval_log_path = config.log_dir / "msa_eval.jsonl"
+
+    print("\nStarting MSA training: %d episodes, batch_size=%d" % (config.num_episodes, config.batch_size))
+    print("Train: %d MSAs, Eval: %d MSAs" % (len(train_dataset), len(eval_dataset)))
+    print("Action: op in [%.1f, %.1f], ep in [%.1f, %.1f]\n" % (
+        config.op_min, config.op_max, config.ep_min, config.ep_max))
+
+    episode = start_episode
+    batch_count = 0
+
+    while episode < config.num_episodes:
+        batch_states = []
+        batch_raw_actions = []
+        batch_rewards = []
+        batch_infos = []
+        batch_start = time.time()
+
+        for _ in range(config.batch_size):
+            state = train_env.reset()
+            action, raw_action, log_prob, entropy = agent.select_action(state)
+            reward, info = train_env.step(action)
+
+            batch_states.append(state)
+            batch_raw_actions.append(raw_action)
+            batch_rewards.append(reward)
+            batch_infos.append(info)
+            episode += 1
+
+        # Update
+        batch = {
+            "states": batch_states,
+            "raw_actions": batch_raw_actions,
+            "rewards": batch_rewards,
+        }
+        metrics = agent.update(batch)
+        batch_elapsed = time.time() - batch_start
+        batch_count += 1
+
+        # Log training
+        train_record = {
+            "episode": episode,
+            "batch": batch_count,
+            "reward_mean": float(np.mean(batch_rewards)),
+            "reward_std": float(np.std(batch_rewards)),
+            "sp_mean": float(np.mean([i["sp"] for i in batch_infos])),
+            "tc_mean": float(np.mean([i["tc"] for i in batch_infos])),
+            "op_mean": float(np.mean([i["op"] for i in batch_infos])),
+            "ep_mean": float(np.mean([i["ep"] for i in batch_infos])),
+            "elapsed": batch_elapsed,
+            **metrics,
+        }
+        with open(train_log_path, "a") as f:
+            f.write(json.dumps(train_record) + "\n")
+
+        # Print progress
+        if batch_count % 10 == 0:
+            avg_op = np.mean([i["op"] for i in batch_infos])
+            avg_ep = np.mean([i["ep"] for i in batch_infos])
+            errors = sum(1 for i in batch_infos if "error" in i)
+            err_str = " err=%d" % errors if errors else ""
+            print(
+                "[Ep %6d] R=%.4f SP=%.4f TC=%.4f "
+                "loss=%.4f ent=%.2f "
+                "op=%.2f ep=%.3f%s "
+                "(%.1fs)" % (
+                    episode, train_record["reward_mean"],
+                    train_record["sp_mean"], train_record["tc_mean"],
+                    metrics["loss"], metrics["entropy"],
+                    avg_op, avg_ep, err_str,
+                    batch_elapsed,
+                )
+            )
+
+        # Checkpoint
+        if episode % config.checkpoint_every < config.batch_size:
+            save_checkpoint(
+                policy, agent.optimizer, episode,
+                config.checkpoint_dir,
+                extra={"baseline": agent._baseline},
+            )
+
+        # Eval
+        if episode % config.eval_every < config.batch_size and len(eval_dataset) > 0:
+            eval_start = time.time()
+            eval_metrics = _evaluate(agent, eval_env, eval_dataset, greedy=True)
+            eval_elapsed = time.time() - eval_start
+
+            eval_record = {"episode": episode, "elapsed": eval_elapsed, **eval_metrics}
+            with open(eval_log_path, "a") as f:
+                f.write(json.dumps(eval_record) + "\n")
+
+            print(
+                "  [EVAL] R=%.4f+/-%.4f SP=%.4f TC=%.4f (%d cases, %.1fs)" % (
+                    eval_metrics["reward_mean"], eval_metrics["reward_std"],
+                    eval_metrics["sp_mean"], eval_metrics["tc_mean"],
+                    eval_metrics["n_cases"], eval_elapsed,
+                )
+            )
+            for rs, data in sorted(eval_metrics["per_set"].items()):
+                print(
+                    "    %s: R=%.4f SP=%.4f TC=%.4f (n=%d)" % (
+                        rs, data["reward_mean"], data["sp_mean"],
+                        data["tc_mean"], data["n_cases"],
+                    )
+                )
+
+    # Final checkpoint
+    save_checkpoint(
+        policy, agent.optimizer, episode,
+        config.checkpoint_dir,
+        filename="checkpoint_final.pt",
+        extra={"baseline": agent._baseline},
+    )
+    print("\nMSA training complete. %d episodes." % episode)

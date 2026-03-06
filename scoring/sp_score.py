@@ -47,7 +47,7 @@ def sp_score(
 ) -> float:
     """Compute SP score: fraction of reference pairs found in prediction.
 
-    SP = |ref_pairs ∩ pred_pairs| / |ref_pairs|
+    SP = |ref_pairs & pred_pairs| / |ref_pairs|
 
     Args:
         pred_seq1: Predicted alignment of sequence 1 (with gaps).

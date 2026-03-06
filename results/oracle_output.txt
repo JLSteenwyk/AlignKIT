@@ -1,0 +1,43 @@
+Loading data...
+Loading BAliBASE pairwise references...
+  RV30: loaded 76370 pairwise references from 30 files
+  RV12: loaded 2335 pairwise references from 44 files
+  RV20: loaded 50062 pairwise references from 41 files
+  RV50: loaded 7538 pairwise references from 16 files
+  RV40: loaded 23445 pairwise references from 49 files
+  RV11: loaded 943 pairwise references from 38 files
+Building train examples...
+  Skipped 32421 pairs exceeding max_seq_length=500
+  Train: 97289 pairs
+Building eval examples...
+  Skipped 16666 pairs exceeding max_seq_length=500
+  Eval: 14317 pairs
+Eval: 14317 pairs
+
+=== NW Default (go=10, ge=0.5) ===
+  Reward: 0.5970 +/- 0.2773
+  SP: 0.5970  TC: 0.5970
+  Time: 505s
+    RV40: R=0.5995 (n=12124)
+    RV50: R=0.5833 (n=2193)
+
+=== Best Constant NW (grid search) ===
+  Reward: 0.6331 +/- 0.2717
+  SP: 0.6331  TC: 0.6331
+  Best: go=18, ge=0.5
+  Time: 2025s
+
+=== Per-Pair Oracle (200-pair sample) ===
+  Reward: 0.6859 +/- 0.2394
+  SP: 0.6859  TC: 0.6859
+  Time: 480s
+
+=== Summary ===
+  NW default (go=10, ge=0.5):  R=0.5970
+  Best constant (go=18, ge=0.5):  R=0.6331  (+0.0361)
+  RL agent (ep 22K greedy):    R=0.6044  (+0.0074)
+  Per-pair oracle:             R=0.6859  (+0.0889)
+  Oracle headroom:             0.0889
+  RL captured:                 8.3% of headroom
+
+Saved to results/pairwise_oracle.json
