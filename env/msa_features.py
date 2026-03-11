@@ -1,9 +1,12 @@
 """State feature extraction for MSA test cases (N-sequence inputs).
 
-20-dimensional feature vector capturing MSA properties that help the agent
+28-dimensional feature vector capturing MSA properties that help the agent
 select appropriate MAFFT parameters.
 
-Adapted from pilot's msa_state_features.py with inlined helper functions.
+Features 0-19: original set (size, length heterogeneity, similarity,
+               composition, complexity)
+Features 20-27: extended set (gap propensity, length skewness, Neff,
+                distance variance, identity stats)
 """
 
 import random
@@ -76,8 +79,47 @@ def _low_complexity_fraction(seq: str, min_run: int = 4) -> float:
     return in_run / n
 
 
+def _pairwise_kmer_identity(seq1: str, seq2: str, k: int = 2) -> float:
+    """Fast alignment-free sequence identity estimate via 2-mer composition."""
+    if len(seq1) < k or len(seq2) < k:
+        return 0.0
+    def kmer_freq(s):
+        counts = {}
+        for i in range(len(s) - k + 1):
+            kmer = s[i:i+k]
+            counts[kmer] = counts.get(kmer, 0) + 1
+        total = len(s) - k + 1
+        return {km: c / total for km, c in counts.items()}
+    f1 = kmer_freq(seq1.upper())
+    f2 = kmer_freq(seq2.upper())
+    all_kmers = set(f1) | set(f2)
+    overlap = sum(min(f1.get(km, 0.0), f2.get(km, 0.0)) for km in all_kmers)
+    return min(overlap, 1.0)
+
+
+def _effective_num_sequences(sequences: List[str], max_seqs: int = 50) -> float:
+    """Estimate Neff from pairwise 2-mer identity clustering at 62% threshold.
+
+    Returns Neff normalized by N (in [0, 1] range: 1/N = all identical, 1.0 = all unique).
+    """
+    seqs = sequences[:max_seqs]
+    n = len(seqs)
+    if n < 2:
+        return 1.0
+    # Count how many neighbors each sequence has (identity > 0.62)
+    cluster_sizes = [1] * n
+    for i in range(n):
+        for j in range(i + 1, n):
+            ident = _pairwise_kmer_identity(seqs[i], seqs[j], k=2)
+            if ident > 0.62:
+                cluster_sizes[i] += 1
+                cluster_sizes[j] += 1
+    neff = sum(1.0 / cs for cs in cluster_sizes)
+    return min(neff / n, 1.0)
+
+
 def extract_msa_features(sequences: List[str]) -> np.ndarray:
-    """Extract 20 features from a list of raw (ungapped) sequences.
+    """Extract 28 features from a list of raw (ungapped) sequences.
 
     Features:
         0-2:   Size & scale (num_seqs, avg_len, total_residues)
@@ -85,9 +127,16 @@ def extract_msa_features(sequences: List[str]) -> np.ndarray:
         7-11:  Pairwise similarity (mean/std/min/max Jaccard, twilight frac)
         12-17: Composition (hydro, charged, polar, small, aromatic, pro+gly)
         18-19: Complexity (entropy, low-complexity frac)
+        20:    Length skewness (asymmetry in length distribution)
+        21:    Gap propensity (fraction of seqs with length < 0.5 * max_len)
+        22:    Neff (effective number of sequences, normalized)
+        23-24: 2-mer identity (mean, std)
+        25:    2-mer identity range (max - min)
+        26:    Fraction of pairs with 2-mer identity < 0.25 (deep twilight)
+        27:    Fraction of pairs with 2-mer identity > 0.80 (near-identical)
 
     Returns:
-        numpy array of shape (20,) with float32 features.
+        numpy array of shape (28,) with float32 features.
     """
     n = len(sequences)
     lengths = [len(s) for s in sequences]
@@ -143,6 +192,44 @@ def extract_msa_features(sequences: List[str]) -> np.ndarray:
     avg_entropy = float(np.mean([_sequence_entropy(s) for s in sequences]))
     avg_lc = float(np.mean([_low_complexity_fraction(s) for s in sequences]))
 
+    # --- Extended features (20-27) ---
+
+    # Length skewness
+    if len(lengths) > 2 and np.std(lengths) > 0:
+        length_skewness = float(np.clip(
+            np.mean(((np.array(lengths) - np.mean(lengths)) / np.std(lengths)) ** 3),
+            -3.0, 3.0
+        ) / 3.0)  # normalize to [-1, 1]
+    else:
+        length_skewness = 0.0
+
+    # Gap propensity: fraction of sequences much shorter than longest
+    gap_propensity = float(np.mean([1.0 if l < 0.5 * max_len else 0.0 for l in lengths])) if max_len > 0 else 0.0
+
+    # Effective number of sequences (diversity measure)
+    neff = _effective_num_sequences(sequences, max_seqs=50)
+
+    # 2-mer identity (more accurate than 3-mer Jaccard for identity estimation)
+    if n >= 2:
+        all_pairs_2mer = [(i, j) for i in range(min(n, 50)) for j in range(i + 1, min(n, 50))]
+        if len(all_pairs_2mer) > 50:
+            sampled_2mer = random.sample(all_pairs_2mer, 50)
+        else:
+            sampled_2mer = all_pairs_2mer
+        identities = [_pairwise_kmer_identity(sequences[i].upper(), sequences[j].upper(), k=2)
+                      for i, j in sampled_2mer]
+        kmer2_mean = float(np.mean(identities))
+        kmer2_std = float(np.std(identities))
+        kmer2_range = float(np.max(identities) - np.min(identities))
+        deep_twilight_frac = float(np.mean([1.0 if x < 0.25 else 0.0 for x in identities]))
+        near_identical_frac = float(np.mean([1.0 if x > 0.80 else 0.0 for x in identities]))
+    else:
+        kmer2_mean = 0.0
+        kmer2_std = 0.0
+        kmer2_range = 0.0
+        deep_twilight_frac = 0.0
+        near_identical_frac = 0.0
+
     return np.array([
         num_sequences_norm, avg_length_norm, total_residues_norm,
         length_cv, min_max_length_ratio, length_range_norm, median_length_ratio,
@@ -150,4 +237,7 @@ def extract_msa_features(sequences: List[str]) -> np.ndarray:
         max_pairwise_identity, identity_twilight_frac,
         avg_hydrophobic, avg_charged, avg_polar, avg_small, avg_aromatic, avg_pg,
         avg_entropy, avg_lc,
+        length_skewness, gap_propensity, neff,
+        kmer2_mean, kmer2_std, kmer2_range,
+        deep_twilight_frac, near_identical_frac,
     ], dtype=np.float32)

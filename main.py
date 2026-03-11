@@ -65,6 +65,8 @@ def cmd_msa_train(args):
         config.seed = args.seed
     if args.eval_every:
         config.eval_every = args.eval_every
+    if args.no_benchmarks:
+        config.use_benchmarks = False
 
     train_msa(config, resume_from=args.resume)
 
@@ -115,7 +117,9 @@ def main():
     msa_train_parser.add_argument("--resume", type=str, default=None,
                                   help="Resume from checkpoint file (e.g. checkpoint_latest.pt)")
     msa_train_parser.add_argument("--eval-every", type=int, default=None,
-                                  help="Evaluate every N episodes (default: 200)")
+                                  help="Evaluate every N episodes (default: 500)")
+    msa_train_parser.add_argument("--no-benchmarks", action="store_true",
+                                  help="Disable external benchmarks (BAliBASE only)")
 
     msa_eval_parser = subparsers.add_parser("msa-evaluate", help="Evaluate MSA agent")
     msa_eval_parser.add_argument("--checkpoint", type=str, help="Checkpoint filename")

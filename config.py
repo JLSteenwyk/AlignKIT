@@ -62,7 +62,7 @@ class MSAConfig:
     """Hyperparameters and paths for MSA RL training."""
 
     # Policy
-    input_dim: int = 20        # MSA feature dimension
+    input_dim: int = 28        # MSA feature dimension (20 original + 8 extended)
     action_dim: int = 2        # (op, ep) for MAFFT
     hidden_sizes: List[int] = field(default_factory=lambda: [128, 128])
     initial_log_std: float = 0.0
@@ -93,6 +93,8 @@ class MSAConfig:
     data_dir: Path = Path("data/bb3_release")
     train_ref_sets: List[str] = field(default_factory=lambda: ["RV11", "RV12", "RV20", "RV30"])
     eval_ref_sets: List[str] = field(default_factory=lambda: ["RV40", "RV50"])
+    benchmark_dir: Path = Path("data/benchmarks")
+    use_benchmarks: bool = True
 
     # MAFFT
     mafft_bin: Path = Path("/mnt/ca1e2e99-718e-417c-9ba6-62421455971a/SOFTWARE/mafft-7.525-with-extensions/bin/mafft")
@@ -101,8 +103,8 @@ class MSAConfig:
 
     # Checkpointing
     checkpoint_dir: Path = Path("checkpoints_msa")
-    checkpoint_every: int = 100
-    eval_every: int = 200
+    checkpoint_every: int = 500
+    eval_every: int = 500
 
     # Logging
     log_dir: Path = Path("logs_msa")

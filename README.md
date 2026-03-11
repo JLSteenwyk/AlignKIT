@@ -1,144 +1,244 @@
 # RLALIGN — RL for Sequence Alignment Parameter Optimization
 
-Reinforcement learning framework that learns to select alignment tools
-(MAFFT, MUSCLE, Clustal Omega) and their parameters on a per-input basis,
-optimizing SP and TC scores against reference alignments.
+An exploration of reinforcement learning for adaptive gap penalty selection in
+protein sequence alignment. The project investigated whether an RL agent can
+learn to predict alignment-specific parameters that outperform fixed defaults.
 
-## Architecture
+**Status: Concluded.** The approach produces a small but consistent improvement
+over MAFFT defaults (+2% reward), but the gain is too modest to justify
+further development. This README documents what was built, what was learned,
+and why the project was sunset.
 
-**Contextual bandit** — each episode the agent observes a 20-dimensional
-feature vector describing the input sequences (size, length heterogeneity,
-pairwise identity, composition, complexity) and selects a single discrete
-action specifying the tool and its full parameter configuration.  The reward
-is the weighted average of SP and TC scores against a structural reference.
 
-### Action space (380 actions)
+## Motivation
 
-| Tool       | Parameters                                    | Count |
-|------------|-----------------------------------------------|------:|
-| MAFFT      | op (5) × ep (4) × strategy (4) × maxiter (4) |   320 |
-| MUSCLE v5  | command (1) × perm (4) × perturb (5)          |    20 |
-| Clustal Ω  | iter (5) × full (2) × full-iter (2) × kimura (2) | 40 |
+Multiple sequence alignment tools like MAFFT use fixed gap penalties (opening
+penalty op=1.53, extension penalty ep=0.0) regardless of the input sequences.
+An exhaustive oracle analysis on BAliBASE 3.0 showed that per-case parameter
+tuning could improve alignment quality — but by how much?
 
-### State features (20-dim)
+### Oracle Analysis (185 actions x 42 cases)
 
-- Size & scale: num_sequences, avg_length, total_residues
-- Length heterogeneity: CV, min/max ratio, range, median ratio
-- Pairwise similarity: mean/std/min/max k-mer Jaccard, twilight fraction
-- Composition: hydrophobic, charged, polar, small, aromatic, Pro+Gly fractions
-- Complexity: normalized AA entropy, low-complexity fraction
+| Component | Reward | vs Default |
+|-----------|:------:|:----------:|
+| MAFFT --auto default (op=1.53, ep=0.0) | 0.441 | -- |
+| Best fixed config (op=4.0, ep=0.1, --localpair) | 0.506 | +14.7% |
+| MAFFT per-case oracle | 0.532 | +20.6% |
+| Full oracle (all 185 tool configs) | 0.536 | +21.5% |
 
-## Datasets
+Key findings:
+- **MAFFT dominates**: oracle-best tool on 34/42 cases (81%)
+- **Parameter tuning is the main opportunity**: 85% of oracle headroom comes
+  from per-case MAFFT parameter adaptation, not cross-tool selection
+- **No universal optimum**: 35 unique best actions across 42 cases
 
-Training and evaluation use structural reference alignments from multiple
-benchmarks.  A stratified 80/20 split within each source ensures every
-dataset is represented in both train and eval.
+These findings motivated focusing on MAFFT parameter prediction rather than
+tool selection.
 
-| Source   | Total MSAs | Description                                  |
-|----------|-----------|----------------------------------------------|
-| BAliBASE RV11 | 38  | Equidistant families, <20% identity          |
-| BAliBASE RV12 | 44  | Equidistant families, 20-40% identity        |
-| BAliBASE RV20 | 41  | Families with orphan sequences               |
-| BAliBASE RV30 | 30  | Divergent subfamily pairs                    |
-| BAliBASE RV40 | 49  | Sequences with large N/C extensions          |
-| BAliBASE RV50 | 16  | Internal insertions                          |
-| HOMSTRAD | 233       | Structural alignments from homologous families|
-| OXBench  | 395       | Wide identity range (Edgar BENCH 1.0)        |
-| SABRE    | 423       | Remote homologs, all twilight-zone           |
 
-### Database balancing via farthest-point subsampling
+## What Was Built
 
-The external benchmarks (HOMSTRAD, OXBench, SABRE) are much larger than the
-BAliBASE subsets and would dominate training.  To equalize representation
-while preserving diversity, each external benchmark's **training portion** is
-subsampled to match the total BAliBASE training count (~172) using
-**farthest-point sampling** in the 20-dim state feature space:
+### Phase 1: Pairwise Alignment (Needleman-Wunsch)
 
-1. Z-score normalize all features within the database
-2. Seed with the medoid (point closest to centroid)
-3. Iteratively select the point with maximum min-distance to selected set
-4. Repeat until target count is reached
+A custom NW implementation with position-dependent affine gap penalties, where
+an RL agent predicts gap_open and gap_extend for K=3 sequence regions
+(N-terminal, middle, C-terminal).
 
-This guarantees outliers are selected first and the chosen subset fills the
-feature space evenly.  The eval split is left untouched for comprehensive
-evaluation.
+- **Agent**: Gaussian continuous policy (12-dim features -> 6-dim actions)
+- **Training**: 50K episodes on BAliBASE pairwise pairs
+- **Result**: Agent learned gap_open ~ 17 (near optimal 18) but failed to
+  find optimal gap_extend (learned ~1.7 vs optimal 0.5). Captured only 8.3%
+  of oracle headroom.
+- **Conclusion**: 6-dimensional exploration made it hard to disentangle
+  parameter effects with limited data.
 
-**Balanced training composition** (with `--subsample 172`):
+### Phase 2: MSA with Continuous MAFFT Parameters
 
-| Source   | Train | Eval | Train % |
-|----------|------:|-----:|--------:|
-| BAliBASE | 172   | 45   | 25.0%   |
-| HOMSTRAD | 172   | 47   | 25.0%   |
-| OXBench  | 172   | 79   | 25.0%   |
-| SABRE    | 172   | 85   | 25.0%   |
-| **Total**| **688**|**257**|         |
+Scaled up to multiple sequence alignment by wrapping MAFFT. The agent predicts
+two continuous parameters per alignment case:
+- **op** (gap opening penalty): range [0.5, 5.0]
+- **ep** (gap extension penalty): range [0.0, 1.0]
+
+MAFFT runs with `--localpair --maxiterate 10` (L-INS-i algorithm) using the
+agent's predicted parameters.
+
+**Architecture:**
+- Input: 28-dim feature vector (sequence lengths, composition, complexity,
+  pairwise similarity, Neff, length skewness, gap propensity)
+- Policy: Gaussian MLP (28 -> 128 -> 128 -> 2) with sigmoid transform
+- Training: REINFORCE with learned value baseline, advantage normalization
+- Formulation: Contextual bandit (single decision per alignment case)
+
+**Data:**
+
+| Split | Source | Cases |
+|-------|--------|------:|
+| Train | BAliBASE RV11/RV12/RV20/RV30 | 153 |
+| Train | OXBench + SABRE + HOMSTRAD | 840 |
+| Eval  | BAliBASE RV40/RV50 | 65 |
+| Eval  | OXBench + SABRE + HOMSTRAD (20%) | 211 |
+
+### Results
+
+**BAliBASE evaluation (RV40 + RV50, n=65):**
+
+| Method | Reward | SP | TC |
+|--------|:------:|:--:|:--:|
+| MAFFT --auto (default) | 0.446 | 0.698 | 0.193 |
+| MAFFT L-INS-i (default params) | 0.448 | 0.703 | 0.194 |
+| RL Agent v1 (20-dim, BAliBASE only) | **0.454** | 0.705 | **0.203** |
+| RL Agent v2 (28-dim, + benchmarks) | 0.450 | **0.708** | 0.193 |
+
+Best result: **+2.0% reward, +5.4% TC** over MAFFT --auto (v1 agent).
+
+**What the agent learned:**
+- op ~ 3.0 (nearly 2x the MAFFT default of 1.53)
+- ep ~ 0.4 (vs default of 0.0)
+- Both parameters stabilized by ~2000 episodes
+
+**What the agent did NOT learn:**
+- Meaningful per-case adaptation. The agent converged to a near-constant
+  prediction across all inputs rather than using features to tailor parameters.
+- Adding more training data (benchmarks) and richer features (28-dim) did not
+  improve BAliBASE results — the extra data diluted the signal without
+  enabling better adaptation.
+
+
+## Why the Project Was Sunset
+
+1. **The improvement is too small.** A 2% gain over defaults, while
+   consistent, is not enough to justify the complexity of an RL system.
+   A simple grid search over op/ep would likely match or exceed the agent.
+
+2. **The agent learns a better global default, not per-case adaptation.**
+   The core thesis — that sequence features can drive case-specific gap
+   penalties — was not validated. The policy outputs are nearly constant
+   regardless of input.
+
+3. **Limited headroom.** The oracle analysis showed that even perfect
+   parameter selection yields only +20% over defaults. With just op and ep,
+   the ceiling is lower. The agent captured a small fraction of this.
+
+4. **Data limitations.** 153 BAliBASE training cases is thin for learning
+   a feature-to-parameter mapping. Adding external benchmarks helped with
+   diversity but introduced distribution mismatch.
+
+5. **The baseline is strong.** MAFFT's defaults are well-tuned. Beating
+   a mature tool's 20+ years of parameter engineering with RL requires
+   either more expressive actions (position-specific penalties, algorithm
+   selection) or a fundamentally different approach.
+
+
+## What Would Be Needed for Publication
+
+If someone wanted to continue this work:
+
+- **Statistical significance testing** on per-case improvements
+- **Ablation studies**: which features matter, does the agent truly adapt
+- **Stronger baselines**: grid search, linear regression, parameter advisors
+  (DeBlasio & Kececioglu, 2017)
+- **Broader action space**: add strategy selection, maxiterate, or
+  position-specific penalties
+- **Cross-validation** instead of fixed train/eval splits
+- **Analysis of learned behavior**: when/why does the agent deviate from
+  its mean prediction
+
+
+## Related Work
+
+- **Parameter Advisors** (DeBlasio & Kececioglu, 2015-2017): Closest prior
+  work. Facet accuracy estimator selects from discrete parameter sets for
+  the Opal aligner. Different approach (accuracy estimation vs policy gradient)
+  but same goal.
+- **RL-based aligners** (DPAMSA 2023, RLALIGN 2018): Use RL to perform
+  alignment directly (gap insertion decisions). Our approach wraps an
+  existing aligner instead.
+- **Standard MSA tools** (MAFFT, MUSCLE, Clustal Omega): None adapt gap
+  penalties based on input sequence characteristics.
+
 
 ## Usage
 
 ```bash
-# Setup
 source venv/bin/activate
 
-# MSA training with balanced databases (recommended)
-python main.py msa-train --episodes 100000 --batch-size 8 --subsample 172
+# Train (BAliBASE + benchmarks, 28-dim features)
+CUDA_VISIBLE_DEVICES="" python main.py msa-train --episodes 10000
 
-# MSA training without subsampling (original behavior)
-python main.py msa-train --episodes 100000 --batch-size 8
+# Train (BAliBASE only)
+CUDA_VISIBLE_DEVICES="" python main.py msa-train --episodes 10000 --no-benchmarks
 
-# Resume from checkpoint
-python main.py msa-train --episodes 100000 --resume checkpoint_latest.pt
+# Resume training
+CUDA_VISIBLE_DEVICES="" python main.py msa-train --resume checkpoint_latest.pt
 
 # Evaluate
-python main.py msa-evaluate --checkpoint checkpoint_latest.pt
+CUDA_VISIBLE_DEVICES="" python main.py msa-evaluate
 
-# Run baselines (MAFFT/MUSCLE/ClustalO defaults)
-python main.py msa-baseline
+# Pairwise NW training (Phase 1)
+CUDA_VISIBLE_DEVICES="" python main.py pw-train --episodes 50000
 
-# Visualize training curves
-python main.py msa-visualize
+# Regenerate figures
+python results/msa_continuous/generate_figures.py
+python results/msa_continuous/workflow_diagram.py
 ```
 
-## Project structure
+Note: `CUDA_VISIBLE_DEVICES=""` is required — PyTorch version is too old for
+the RTX 6000 Ada GPUs (sm_89).
+
+
+## Project Structure
 
 ```
 RLALIGN/
-├── main.py                  # CLI entry point
-├── config_msa.py            # MSA configuration dataclass
+├── main.py                       # CLI: pw-train, pw-evaluate, msa-train, msa-evaluate
+├── config.py                     # Config and MSAConfig dataclasses
 ├── agent/
-│   ├── policy_network.py    # Feed-forward policy (20 -> 128 -> 128 -> 380)
-│   └── reinforce.py         # REINFORCE with baseline
+│   ├── continuous_policy.py      # Gaussian policy with sigmoid transform
+│   └── reinforce_continuous.py   # REINFORCE with value baseline
 ├── data/
-│   ├── msa_dataset.py       # MSATestCase, MSADataset, build_msa_datasets
-│   ├── benchmark_loader.py  # OXBench, SABRE, HOMSTRAD loaders
-│   ├── subsample.py         # Farthest-point diversity subsampling
-│   └── balibase_parser.py   # BAliBASE MSF parser
+│   ├── balibase_parser.py        # BAliBASE MSF parser
+│   ├── msa_dataset.py            # MSATestCase, MSADataset, loaders
+│   ├── benchmark_loader.py       # OXBench, SABRE, HOMSTRAD loaders
+│   └── pairwise_dataset.py       # Pairwise pair extraction
 ├── env/
-│   ├── msa_alignment_env.py # Bandit environment (reset/step)
-│   ├── msa_action_space.py  # 380-action discrete space
-│   └── msa_state_features.py# 20-dim feature extraction
+│   ├── msa_env.py                # MSA bandit environment (MAFFT wrapper)
+│   ├── msa_features.py           # 28-dim MSA feature extraction
+│   ├── pairwise_env.py           # Pairwise NW environment
+│   ├── pairwise_features.py      # 12-dim pairwise features
+│   └── needleman_wunsch.py       # Vectorized NW with affine gaps
 ├── scoring/
-│   ├── msa_sp_score.py      # Sum-of-pairs score
-│   ├── msa_tc_score.py      # Total-column score
-│   └── reward.py            # Weighted SP+TC reward
+│   ├── msa_sp_score.py           # MSA sum-of-pairs score
+│   ├── msa_tc_score.py           # MSA total-column score
+│   ├── sp_score.py               # Pairwise SP score
+│   ├── tc_score.py               # Pairwise TC score
+│   └── reward.py                 # Weighted SP+TC reward
 ├── training/
-│   ├── train_msa.py         # Main training loop
-│   ├── checkpointer.py      # Save/load checkpoints
-│   └── logger.py            # JSONL metric logger
+│   ├── train_msa.py              # MSA training loop
+│   ├── train_pairwise.py         # Pairwise training loop
+│   └── checkpointer.py           # Checkpoint save/load
 ├── evaluation/
-│   ├── evaluate_msa.py      # Full greedy evaluation
-│   └── msa_baselines.py     # Default-parameter baselines
-└── visualization/
-    └── msa_plots.py         # Training curve plots
+│   ├── evaluate_msa.py           # MSA eval + baselines
+│   └── evaluate_pairwise.py      # Pairwise eval + baselines
+├── results/
+│   ├── oracle_analysis/          # Exhaustive oracle analysis (185 actions x 42 cases)
+│   ├── msa_continuous/           # MSA RL results, figures, workflow diagram
+│   └── supplementary/            # Oracle analysis figures
+├── logs_msa/                     # Training and eval logs (JSONL)
+├── checkpoints_msa/              # Model checkpoints
+└── archive/                      # Old pilot system code (preserved for reference)
 ```
 
-## Key configuration (`config_msa.py`)
 
-| Parameter                  | Default | Description                        |
-|----------------------------|---------|------------------------------------|
-| `lr`                       | 1e-3    | Learning rate                      |
-| `entropy_coeff`            | 0.01    | Entropy regularization weight      |
-| `baseline_momentum`        | 0.99    | Exponential moving average for baseline |
-| `batch_size`               | 8       | Episodes per policy update         |
-| `subprocess_timeout`       | 600     | Max seconds per alignment tool call|
-| `sp_weight` / `tc_weight`  | 0.5/0.5 | Reward = sp_weight×SP + tc_weight×TC |
-| `subsample_benchmarks_to`  | None    | Subsample external benchmarks (recommended: 172) |
+## Key Numbers
+
+| Metric | Value |
+|--------|-------|
+| BAliBASE training cases | 153 |
+| External benchmark training cases | 840 |
+| BAliBASE eval cases (RV40+RV50) | 65 |
+| MAFFT --auto baseline reward | 0.446 |
+| Best RL agent reward | 0.454 |
+| Improvement over --auto | +2.0% |
+| Oracle ceiling (MAFFT params) | 0.532 |
+| Headroom captured by agent | ~9% of oracle headroom |
+| Training time (10K episodes) | ~10-30 hours (CPU) |

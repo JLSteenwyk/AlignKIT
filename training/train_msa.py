@@ -67,11 +67,33 @@ def train_msa(config: MSAConfig, resume_from: str = None):
 
     device = torch.device("cpu")
 
-    # Data — split by ref_set
+    # Data — BAliBASE split by ref_set + optional external benchmarks
     print("Loading training MSA test cases...")
     train_cases = load_msa_test_cases(config.data_dir, config.train_ref_sets)
     print("Loading evaluation MSA test cases...")
     eval_cases = load_msa_test_cases(config.data_dir, config.eval_ref_sets)
+
+    # Add external benchmarks to training set (80/20 split within each)
+    if getattr(config, "use_benchmarks", False) and hasattr(config, "benchmark_dir"):
+        benchmark_dir = config.benchmark_dir
+        if benchmark_dir.exists():
+            from data.benchmark_loader import load_all_benchmarks
+            print("Loading external benchmark datasets...")
+            bench_cases = load_all_benchmarks(benchmark_dir)
+            if bench_cases:
+                rng = random.Random(config.seed)
+                # Group by ref_set and split 80/20
+                by_set = {}
+                for case in bench_cases:
+                    by_set.setdefault(case.ref_set, []).append(case)
+                for ref_set in sorted(by_set.keys()):
+                    cases = by_set[ref_set]
+                    rng.shuffle(cases)
+                    n_train = max(1, int(len(cases) * 0.8))
+                    train_cases.extend(cases[:n_train])
+                    eval_cases.extend(cases[n_train:])
+                    print("  %s: %d total -> %d train / %d eval" % (
+                        ref_set, len(cases), n_train, len(cases) - n_train))
 
     train_dataset = MSADataset(train_cases)
     eval_dataset = MSADataset(eval_cases)
